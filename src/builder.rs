@@ -9,6 +9,7 @@ use nonempty::NonEmpty;
 use pasta_curves::pallas;
 use rand::{prelude::SliceRandom, CryptoRng, RngCore};
 
+use crate::note::ExtractedNoteCommitment;
 use crate::{
     action::Action,
     address::Address,
@@ -221,6 +222,7 @@ pub struct Builder {
     recipients: Vec<RecipientInfo>,
     flags: Flags,
     anchor: Anchor,
+    value_balance: i64,
 }
 
 impl Builder {
@@ -231,7 +233,13 @@ impl Builder {
             recipients: vec![],
             flags,
             anchor,
+            value_balance: 0,
         }
+    }
+
+    /// Returns the net value represented by the spends and outputs added to this builder.
+    pub fn value_balance(&self) -> i64 {
+        self.value_balance
     }
 
     /// Adds a note to be spent in this transaction.
@@ -258,9 +266,18 @@ impl Builder {
 
         // Consistency check: all anchors must be equal.
         let cm = note.commitment();
+        println!(
+            "CMX from note is {}",
+            hex::encode(ExtractedNoteCommitment::from(cm.clone()).to_bytes())
+        );
         let path_root: Anchor =
             <Option<_>>::from(merkle_path.root(cm.into())).ok_or("Derived the bottom anchor")?;
         if path_root != self.anchor {
+            println!(
+                "l:{} r:{}",
+                hex::encode(path_root.to_bytes()),
+                hex::encode(self.anchor.to_bytes())
+            );
             return Err("All anchors must be equal.");
         }
 
@@ -276,6 +293,8 @@ impl Builder {
             note,
             merkle_path,
         });
+
+        self.value_balance += note.value().inner() as i64;
 
         Ok(())
     }
@@ -298,6 +317,8 @@ impl Builder {
             value,
             memo,
         });
+
+        self.value_balance -= value.inner() as i64;
 
         Ok(())
     }
