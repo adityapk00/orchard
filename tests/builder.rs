@@ -3,7 +3,7 @@ use orchard::{
     builder::Builder,
     bundle::{Authorized, Flags},
     circuit::{ProvingKey, VerifyingKey},
-    keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
+    keys::{FullViewingKey, PreparedIncomingViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
     note::ExtractedNoteCommitment,
     note_encryption::OrchardDomain,
     tree::{MerkleHashOrchard, MerklePath},
@@ -49,7 +49,7 @@ fn bundle_chain() {
         let unauthorized = builder.build(&mut rng).unwrap();
         let sighash = unauthorized.commitment().into();
         let proven = unauthorized.create_proof(&pk, &mut rng).unwrap();
-        proven.apply_signatures(&mut rng, sighash, &[]).unwrap()
+        proven.apply_signatures(rng, sighash, &[]).unwrap()
     };
 
     // Verify the shielding bundle.
@@ -57,7 +57,7 @@ fn bundle_chain() {
 
     // Create a shielded bundle spending the previous output.
     let shielded_bundle: Bundle<_, i64> = {
-        let ivk = fvk.to_ivk(Scope::External);
+        let ivk = PreparedIncomingViewingKey::new(&fvk.to_ivk(Scope::External));
         let (note, _, _) = shielding_bundle
             .actions()
             .iter()
@@ -92,7 +92,7 @@ fn bundle_chain() {
         let sighash = unauthorized.commitment().into();
         let proven = unauthorized.create_proof(&pk, &mut rng).unwrap();
         proven
-            .apply_signatures(&mut rng, sighash, &[SpendAuthorizingKey::from(&sk)])
+            .apply_signatures(rng, sighash, &[SpendAuthorizingKey::from(&sk)])
             .unwrap()
     };
 

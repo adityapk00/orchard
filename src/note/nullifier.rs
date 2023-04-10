@@ -1,5 +1,6 @@
 use group::{ff::PrimeField, Group};
 use halo2_proofs::arithmetic::CurveExt;
+use memuse::DynamicUsage;
 use pasta_curves::pallas;
 use rand::RngCore;
 use subtle::CtOption;
@@ -13,6 +14,9 @@ use crate::{
 /// A unique nullifier for a note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Nullifier(pub(crate) pallas::Base);
+
+// We know that `pallas::Base` doesn't allocate internally.
+memuse::impl_no_dynamic_usage!(Nullifier);
 
 impl Nullifier {
     /// Generates a dummy nullifier for use as $\rho$ in dummy spent notes.
@@ -62,8 +66,8 @@ impl Nullifier {
 #[cfg(any(test, feature = "test-dependencies"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-dependencies")))]
 pub mod testing {
-    use group::Group;
-    use pasta_curves::{arithmetic::FieldExt, pallas};
+    use group::{ff::FromUniformBytes, Group};
+    use pasta_curves::pallas;
     use proptest::collection::vec;
     use proptest::prelude::*;
 
@@ -75,7 +79,7 @@ pub mod testing {
         pub fn arb_nullifier()(
             bytes in vec(any::<u8>(), 64)
         ) -> Nullifier {
-            let point = pallas::Point::generator() * pallas::Scalar::from_bytes_wide(&<[u8; 64]>::try_from(bytes).unwrap());
+            let point = pallas::Point::generator() * pallas::Scalar::from_uniform_bytes(&<[u8; 64]>::try_from(bytes).unwrap());
             Nullifier(extract_p(&point))
         }
     }
