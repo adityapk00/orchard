@@ -5,8 +5,9 @@
 //!   (with maximum value [`MAX_NOTE_VALUE`]), and is serialized in a note plaintext.
 //! - [`ValueSum`], the sum of note values within an Orchard [`Action`] or [`Bundle`].
 //!   It is a signed 64-bit integer (with range [`VALUE_SUM_RANGE`]).
-//! - `valueBalanceOrchard`, which is a signed 63-bit integer. This is represented by a
-//!   user-defined type parameter on [`Bundle`], returned by [`Bundle::value_balance`].
+//! - `valueBalanceOrchard`, which is a signed 63-bit integer. This is represented
+//!    by a user-defined type parameter on [`Bundle`], returned by
+//!    [`Bundle::value_balance`] and [`Builder::value_balance`].
 //!
 //! If your specific instantiation of the Orchard protocol requires a smaller bound on
 //! valid note values (for example, Zcash's `MAX_MONEY` fits into a 51-bit integer), you
@@ -32,6 +33,7 @@
 //! [`Action`]: crate::action::Action
 //! [`Bundle`]: crate::bundle::Bundle
 //! [`Bundle::value_balance`]: crate::bundle::Bundle::value_balance
+//! [`Builder::value_balance`]: crate::builder::Builder::value_balance
 //! [`Builder::add_recipient`]: crate::builder::Builder::add_recipient
 //! [Rust documentation]: https://doc.rust-lang.org/stable/std/primitive.i64.html
 
@@ -142,7 +144,7 @@ pub(crate) enum Sign {
 }
 
 /// A sum of Orchard note values.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ValueSum(i128);
 
 impl ValueSum {
@@ -216,6 +218,20 @@ impl ValueCommitTrapdoor {
     pub(crate) fn inner(&self) -> pallas::Scalar {
         self.0
     }
+
+    /// Constructs `ValueCommitTrapdoor` from the byte representation of a scalar.
+    /// Returns a `None` [`CtOption`] if `bytes` is not a canonical representation
+    /// of a Pallas scalar.
+    ///
+    /// This is a low-level API, requiring a detailed understanding of the
+    /// [use of value commitment trapdoors][orchardbalance] in the Zcash protocol
+    /// to use correctly and securely. It is intended to be used in combination
+    /// with [`ValueCommitment::derive`].
+    ///
+    /// [orchardbalance]: https://zips.z.cash/protocol/protocol.pdf#orchardbalance
+    pub fn from_bytes(bytes: [u8; 32]) -> CtOption<Self> {
+        pallas::Scalar::from_repr(bytes).map(ValueCommitTrapdoor)
+    }
 }
 
 impl Add<&ValueCommitTrapdoor> for ValueCommitTrapdoor {
@@ -286,13 +302,13 @@ impl<'a> Sum<&'a ValueCommitment> for ValueCommitment {
 }
 
 impl ValueCommitment {
-    /// $ValueCommit^Orchard$.
+    /// Derives a `ValueCommitment` by $\mathsf{ValueCommit^{Orchard}}$.
     ///
     /// Defined in [Zcash Protocol Spec § 5.4.8.3: Homomorphic Pedersen commitments (Sapling and Orchard)][concretehomomorphiccommit].
     ///
     /// [concretehomomorphiccommit]: https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit
     #[allow(non_snake_case)]
-    pub(crate) fn derive(value: ValueSum, rcv: ValueCommitTrapdoor) -> Self {
+    pub fn derive(value: ValueSum, rcv: ValueCommitTrapdoor) -> Self {
         let hasher = pallas::Point::hash_to_curve(VALUE_COMMITMENT_PERSONALIZATION);
         let V = hasher(&VALUE_COMMITMENT_V_BYTES);
         let R = hasher(&VALUE_COMMITMENT_R_BYTES);
@@ -345,7 +361,8 @@ impl ValueCommitment {
 #[cfg(any(test, feature = "test-dependencies"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-dependencies")))]
 pub mod testing {
-    use pasta_curves::{arithmetic::FieldExt, pallas};
+    use group::ff::FromUniformBytes;
+    use pasta_curves::pallas;
     use proptest::prelude::*;
 
     use super::{NoteValue, ValueCommitTrapdoor, ValueSum, MAX_NOTE_VALUE, VALUE_SUM_RANGE};
@@ -356,21 +373,21 @@ pub mod testing {
             // Instead of rejecting out-of-range bytes, let's reduce them.
             let mut buf = [0; 64];
             buf[..32].copy_from_slice(&bytes);
-            pallas::Scalar::from_bytes_wide(&buf)
+            pallas::Scalar::from_uniform_bytes(&buf)
         }
     }
 
     prop_compose! {
         /// Generate an arbitrary [`ValueSum`] in the range of valid Zcash values.
         pub fn arb_value_sum()(value in VALUE_SUM_RANGE) -> ValueSum {
-            ValueSum(value as i128)
+            ValueSum(value)
         }
     }
 
     prop_compose! {
         /// Generate an arbitrary [`ValueSum`] in the range of valid Zcash values.
         pub fn arb_value_sum_bounded(bound: NoteValue)(value in -(bound.0 as i128)..=(bound.0 as i128)) -> ValueSum {
-            ValueSum(value as i128)
+            ValueSum(value)
         }
     }
 

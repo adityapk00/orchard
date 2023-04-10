@@ -2,9 +2,9 @@
 
 use core::fmt;
 use core::iter;
+use std::fmt::Display;
 
 use ff::Field;
-use halo2_proofs::circuit::Value;
 use nonempty::NonEmpty;
 use pasta_curves::pallas;
 use rand::{prelude::SliceRandom, CryptoRng, RngCore};
@@ -30,7 +30,7 @@ const MIN_ACTIONS: usize = 2;
 
 /// An error type for the kinds of errors that can occur during bundle construction.
 #[derive(Debug)]
-pub enum Error {
+pub enum BuildError {
     /// A bundle could not be built because required signatures were missing.
     MissingSignatures,
     /// An error occurred in the process of producing a proof for a bundle.
@@ -45,29 +45,100 @@ pub enum Error {
     DuplicateSignature,
 }
 
-impl From<halo2_proofs::plonk::Error> for Error {
-    fn from(e: halo2_proofs::plonk::Error) -> Self {
-        Error::Proof(e)
+impl Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use BuildError::*;
+        match self {
+            MissingSignatures => f.write_str("Required signatures were missing during build"),
+            Proof(e) => f.write_str(&format!("Could not create proof: {}", e)),
+            ValueSum(_) => f.write_str("Overflow occurred during value construction"),
+            InvalidExternalSignature => f.write_str("External signature was invalid"),
+            DuplicateSignature => f.write_str("Signature valid for more than one input"),
+        }
     }
 }
 
-impl From<value::OverflowError> for Error {
+impl std::error::Error for BuildError {}
+
+/// An error type for adding a spend to the builder.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpendError {
+    /// Spends aren't enabled for this builder.
+    SpendsDisabled,
+    /// The anchor provided to this builder doesn't match the merkle path used to add a spend.
+    AnchorMismatch,
+    /// The full viewing key provided didn't match the note provided
+    FvkMismatch,
+}
+
+impl Display for SpendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use SpendError::*;
+        f.write_str(match self {
+            SpendsDisabled => "Spends are not enabled for this builder",
+            AnchorMismatch => "All anchors must be equal.",
+            FvkMismatch => "FullViewingKey does not correspond to the given note",
+        })
+    }
+}
+
+impl std::error::Error for SpendError {}
+
+/// The only error that can occur here is if outputs are disabled for this builder.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutputError;
+
+impl Display for OutputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Outputs are not enabled for this builder")
+    }
+}
+
+impl std::error::Error for OutputError {}
+
+impl From<halo2_proofs::plonk::Error> for BuildError {
+    fn from(e: halo2_proofs::plonk::Error) -> Self {
+        BuildError::Proof(e)
+    }
+}
+
+impl From<value::OverflowError> for BuildError {
     fn from(e: value::OverflowError) -> Self {
-        Error::ValueSum(e)
+        BuildError::ValueSum(e)
     }
 }
 
 /// Information about a specific note to be spent in an [`Action`].
 #[derive(Debug)]
-struct SpendInfo {
-    dummy_sk: Option<SpendingKey>,
-    fvk: FullViewingKey,
-    scope: Scope,
-    note: Note,
-    merkle_path: MerklePath,
+pub struct SpendInfo {
+    pub(crate) dummy_sk: Option<SpendingKey>,
+    pub(crate) fvk: FullViewingKey,
+    pub(crate) scope: Scope,
+    pub(crate) note: Note,
+    pub(crate) merkle_path: MerklePath,
 }
 
 impl SpendInfo {
+    /// This constructor is public to enable creation of custom builders.
+    /// If you are not creating a custom builder, use [`Builder::add_spend`] instead.
+    ///
+    /// Creates a `SpendInfo` from note, full viewing key owning the note,
+    /// and merkle path witness of the note.
+    ///
+    /// Returns `None` if the `fvk` does not own the `note`.
+    ///
+    /// [`Builder::add_spend`]: Builder::add_spend
+    pub fn new(fvk: FullViewingKey, note: Note, merkle_path: MerklePath) -> Option<Self> {
+        let scope = fvk.scope_for_address(&note.recipient())?;
+        Some(SpendInfo {
+            dummy_sk: None,
+            fvk,
+            scope,
+            note,
+            merkle_path,
+        })
+    }
+
     /// Defined in [Zcash Protocol Spec § 4.8.3: Dummy Notes (Orchard)][orcharddummynotes].
     ///
     /// [orcharddummynotes]: https://zips.z.cash/protocol/nu5.pdf#orcharddummynotes
@@ -145,10 +216,6 @@ impl ActionInfo {
         let cv_net = ValueCommitment::derive(v_net, self.rcv.clone());
 
         let nf_old = self.spend.note.nullifier(&self.spend.fvk);
-        let sender_address = self.spend.note.recipient();
-        let rho_old = self.spend.note.rho();
-        let psi_old = self.spend.note.rseed().psi(&rho_old);
-        let rcm_old = self.spend.note.rseed().rcm(&rho_old);
         let ak: SpendValidatingKey = self.spend.fvk.clone().into();
         let alpha = pallas::Scalar::random(&mut rng);
         let rk = ak.randomize(&alpha);
@@ -160,7 +227,6 @@ impl ActionInfo {
         let encryptor = OrchardNoteEncryption::new(
             self.output.ovk,
             note,
-            self.output.recipient,
             self.output.memo.unwrap_or_else(|| {
                 let mut memo = [0; 512];
                 memo[0] = 0xf6;
@@ -183,33 +249,10 @@ impl ActionInfo {
                 cv_net,
                 SigningMetadata {
                     dummy_ask: self.spend.dummy_sk.as_ref().map(SpendAuthorizingKey::from),
-                    parts: SigningParts {
-                        ak: ak.clone(),
-                        alpha,
-                    },
+                    parts: SigningParts { ak, alpha },
                 },
             ),
-            Circuit {
-                path: Value::known(self.spend.merkle_path.auth_path()),
-                pos: Value::known(self.spend.merkle_path.position()),
-                g_d_old: Value::known(sender_address.g_d()),
-                pk_d_old: Value::known(*sender_address.pk_d()),
-                v_old: Value::known(self.spend.note.value()),
-                rho_old: Value::known(rho_old),
-                psi_old: Value::known(psi_old),
-                rcm_old: Value::known(rcm_old),
-                cm_old: Value::known(self.spend.note.commitment()),
-                alpha: Value::known(alpha),
-                ak: Value::known(ak),
-                nk: Value::known(*self.spend.fvk.nk()),
-                rivk: Value::known(self.spend.fvk.rivk(self.spend.scope)),
-                g_d_new: Value::known(note.recipient().g_d()),
-                pk_d_new: Value::known(*note.recipient().pk_d()),
-                v_new: Value::known(note.value()),
-                psi_new: Value::known(note.rseed().psi(&note.rho())),
-                rcm_new: Value::known(note.rseed().rcm(&note.rho())),
-                rcv: Value::known(self.rcv),
-            },
+            Circuit::from_action_context_unchecked(self.spend, note, alpha, self.rcv),
         )
     }
 }
@@ -259,32 +302,22 @@ impl Builder {
         fvk: FullViewingKey,
         note: Note,
         merkle_path: MerklePath,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), SpendError> {
         if !self.flags.spends_enabled() {
-            return Err("Spends are not enabled for this builder");
+            return Err(SpendError::SpendsDisabled);
         }
 
         // Consistency check: all anchors must be equal.
         let cm = note.commitment();
-        println!(
-            "CMX from note is {}",
-            hex::encode(ExtractedNoteCommitment::from(cm.clone()).to_bytes())
-        );
-        let path_root: Anchor =
-            <Option<_>>::from(merkle_path.root(cm.into())).ok_or("Derived the bottom anchor")?;
+        let path_root = merkle_path.root(cm.into());
         if path_root != self.anchor {
-            println!(
-                "l:{} r:{}",
-                hex::encode(path_root.to_bytes()),
-                hex::encode(self.anchor.to_bytes())
-            );
-            return Err("All anchors must be equal.");
+            return Err(SpendError::AnchorMismatch);
         }
 
         // Check if note is internal or external.
         let scope = fvk
             .scope_for_address(&note.recipient())
-            .ok_or("FullViewingKey does not correspond to the given note")?;
+            .ok_or(SpendError::FvkMismatch)?;
 
         self.spends.push(SpendInfo {
             dummy_sk: None,
@@ -306,9 +339,9 @@ impl Builder {
         recipient: Address,
         value: NoteValue,
         memo: Option<[u8; 512]>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), OutputError> {
         if !self.flags.outputs_enabled() {
-            return Err("Outputs are not enabled for this builder");
+            return Err(OutputError);
         }
 
         self.recipients.push(RecipientInfo {
@@ -323,6 +356,43 @@ impl Builder {
         Ok(())
     }
 
+    /// Returns the action spend components that will be produced by the
+    /// transaction being constructed
+    pub fn spends(&self) -> &Vec<impl InputView<()>> {
+        &self.spends
+    }
+
+    /// Returns the action output components that will be produced by the
+    /// transaction being constructed
+    pub fn outputs(&self) -> &Vec<impl OutputView> {
+        &self.recipients
+    }
+
+    /// The net value of the bundle to be built. The value of all spends,
+    /// minus the value of all outputs.
+    ///
+    /// Useful for balancing a transaction, as the value balance of an individual bundle
+    /// can be non-zero. Each bundle's value balance is [added] to the transparent
+    /// transaction value pool, which [must not have a negative value]. (If it were
+    /// negative, the transaction would output more value than it receives in inputs.)
+    ///
+    /// [added]: https://zips.z.cash/protocol/protocol.pdf#orchardbalance
+    /// [must not have a negative value]: https://zips.z.cash/protocol/protocol.pdf#transactions
+    pub fn value_balance<V: TryFrom<i64>>(&self) -> Result<V, value::OverflowError> {
+        let value_balance = self
+            .spends
+            .iter()
+            .map(|spend| spend.note.value() - NoteValue::zero())
+            .chain(
+                self.recipients
+                    .iter()
+                    .map(|recipient| NoteValue::zero() - recipient.value),
+            )
+            .fold(Some(ValueSum::zero()), |acc, note_value| acc? + note_value)
+            .ok_or(OverflowError)?;
+        i64::try_from(value_balance).and_then(|i| V::try_from(i).map_err(|_| value::OverflowError))
+    }
+
     /// Builds a bundle containing the given spent notes and recipients.
     ///
     /// The returned bundle will have no proof or signatures; these can be applied with
@@ -330,7 +400,7 @@ impl Builder {
     pub fn build<V: TryFrom<i64>>(
         mut self,
         mut rng: impl RngCore,
-    ) -> Result<Bundle<InProgress<Unproven, Unauthorized>, V>, Error> {
+    ) -> Result<Bundle<InProgress<Unproven, Unauthorized>, V>, BuildError> {
         // Pair up the spends and recipients, extending with dummy values as necessary.
         let pre_actions: Vec<_> = {
             let num_spends = self.spends.len();
@@ -375,8 +445,8 @@ impl Builder {
             .ok_or(OverflowError)?;
 
         let result_value_balance: V = i64::try_from(value_balance)
-            .map_err(Error::ValueSum)
-            .and_then(|i| V::try_from(i).map_err(|_| Error::ValueSum(value::OverflowError)))?;
+            .map_err(BuildError::ValueSum)
+            .and_then(|i| V::try_from(i).map_err(|_| BuildError::ValueSum(value::OverflowError)))?;
 
         // Compute the transaction binding signing key.
         let bsk = pre_actions
@@ -451,7 +521,7 @@ impl<S: InProgressSignatures, V> Bundle<InProgress<Unproven, S>, V> {
         self,
         pk: &ProvingKey,
         mut rng: impl RngCore,
-    ) -> Result<Bundle<InProgress<Proof, S>, V>, Error> {
+    ) -> Result<Bundle<InProgress<Proof, S>, V>, BuildError> {
         let instances: Vec<_> = self
             .actions()
             .iter()
@@ -526,10 +596,10 @@ pub enum MaybeSigned {
 }
 
 impl MaybeSigned {
-    fn finalize(self) -> Result<redpallas::Signature<SpendAuth>, Error> {
+    fn finalize(self) -> Result<redpallas::Signature<SpendAuth>, BuildError> {
         match self {
             Self::Signature(sig) => Ok(sig),
-            _ => Err(Error::MissingSignatures),
+            _ => Err(BuildError::MissingSignatures),
         }
     }
 }
@@ -573,7 +643,7 @@ impl<V> Bundle<InProgress<Proof, Unauthorized>, V> {
         mut rng: R,
         sighash: [u8; 32],
         signing_keys: &[SpendAuthorizingKey],
-    ) -> Result<Bundle<Authorized, V>, Error> {
+    ) -> Result<Bundle<Authorized, V>, BuildError> {
         signing_keys
             .iter()
             .fold(self.prepare(&mut rng, sighash), |partial, ask| {
@@ -612,11 +682,14 @@ impl<P: fmt::Debug, V> Bundle<InProgress<P, PartiallyAuthorized>, V> {
     pub fn append_signatures(
         self,
         signatures: &[redpallas::Signature<SpendAuth>],
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, BuildError> {
         signatures.iter().try_fold(self, Self::append_signature)
     }
 
-    fn append_signature(self, signature: &redpallas::Signature<SpendAuth>) -> Result<Self, Error> {
+    fn append_signature(
+        self,
+        signature: &redpallas::Signature<SpendAuth>,
+    ) -> Result<Self, BuildError> {
         let mut signature_valid_for = 0usize;
         let bundle = self.map_authorization(
             &mut signature_valid_for,
@@ -636,9 +709,9 @@ impl<P: fmt::Debug, V> Bundle<InProgress<P, PartiallyAuthorized>, V> {
             |_, partial| partial,
         );
         match signature_valid_for {
-            0 => Err(Error::InvalidExternalSignature),
+            0 => Err(BuildError::InvalidExternalSignature),
             1 => Ok(bundle),
-            _ => Err(Error::DuplicateSignature),
+            _ => Err(BuildError::DuplicateSignature),
         }
     }
 }
@@ -647,7 +720,7 @@ impl<V> Bundle<InProgress<Proof, PartiallyAuthorized>, V> {
     /// Finalizes this bundle, enabling it to be included in a transaction.
     ///
     /// Returns an error if any signatures are missing.
-    pub fn finalize(self) -> Result<Bundle<Authorized, V>, Error> {
+    pub fn finalize(self) -> Result<Bundle<Authorized, V>, BuildError> {
         self.try_map_authorization(
             &mut (),
             |_, _, maybe| maybe.finalize(),
@@ -658,6 +731,39 @@ impl<V> Bundle<InProgress<Proof, PartiallyAuthorized>, V> {
                 ))
             },
         )
+    }
+}
+
+/// A trait that provides a minimized view of an Orchard input suitable for use in
+/// fee and change calculation.
+pub trait InputView<NoteRef> {
+    /// An identifier for the input being spent.
+    fn note_id(&self) -> &NoteRef;
+    /// The value of the input being spent.
+    fn value<V: From<u64>>(&self) -> V;
+}
+
+impl InputView<()> for SpendInfo {
+    fn note_id(&self) -> &() {
+        // The builder does not make use of note identifiers, so we can just return the unit value.
+        &()
+    }
+
+    fn value<V: From<u64>>(&self) -> V {
+        V::from(self.note.value().inner())
+    }
+}
+
+/// A trait that provides a minimized view of an Orchard output suitable for use in
+/// fee and change calculation.
+pub trait OutputView {
+    /// The value of the output being produced.
+    fn value<V: From<u64>>(&self) -> V;
+}
+
+impl OutputView for RecipientInfo {
+    fn value<V: From<u64>>(&self) -> V {
+        V::from(self.value.inner())
     }
 }
 
@@ -828,12 +934,15 @@ mod tests {
         builder
             .add_recipient(None, recipient, NoteValue::from_raw(5000), None)
             .unwrap();
+        let balance: i64 = builder.value_balance().unwrap();
+        assert_eq!(balance, -5000);
+
         let bundle: Bundle<Authorized, i64> = builder
             .build(&mut rng)
             .unwrap()
             .create_proof(&pk, &mut rng)
             .unwrap()
-            .prepare(&mut rng, [0; 32])
+            .prepare(rng, [0; 32])
             .finalize()
             .unwrap();
         assert_eq!(bundle.value_balance(), &(-5000))
